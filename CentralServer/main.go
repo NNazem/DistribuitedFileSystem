@@ -2,10 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/gorilla/mux"
+	"github.com/redis/go-redis/v9"
+	"io"
 	"io/ioutil"
 	"mime/multipart"
 	"net/http"
@@ -22,12 +26,13 @@ const MB = 1024 * 1024
 
 func main() {
 
-	client := &httpClient{client: newHttpClient()}
+	clients := &clients{httpClient: newHttpClient(), redisClient: newRedisClient()}
 
 	routerHttp := mux.NewRouter()
 
-	routerHttp.HandleFunc("/sendFile", client.ReceiveFileAndSend).Methods("POST")
-	routerHttp.HandleFunc("/nodesUsage", client.nodesWithUsage).Methods("GET")
+	routerHttp.HandleFunc("/sendFile", clients.ReceiveFileAndSend).Methods("POST")
+	routerHttp.HandleFunc("/nodesUsage", clients.nodesWithUsage).Methods("GET")
+	routerHttp.HandleFunc("/retrieveFile", clients.RetrieveFile).Methods("GET")
 
 	err := http.ListenAndServe(fmt.Sprintf(":%d", serverPort), routerHttp)
 
@@ -36,7 +41,39 @@ func main() {
 	}
 }
 
-func (c *httpClient) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
+func (c *clients) RetrieveFile(w http.ResponseWriter, r *http.Request) {
+	fileName := r.URL.Query().Get("fileName")
+
+	h := sha256.New()
+
+	h.Write([]byte(fileName))
+
+	bs := h.Sum(nil)
+
+	node := c.redisClient.Get(context.Background(), fmt.Sprintf("%x", bs))
+
+	res, err := c.httpClient.Get(fmt.Sprintf("%s/%s?filename=%s", node.Val(), "/retrieveFile", fileName))
+
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if http.StatusOK == res.StatusCode {
+		body := res.Body
+		defer body.Close()
+
+		content, err := io.ReadAll(body)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+
+		w.Write(content)
+		w.WriteHeader(res.StatusCode)
+	}
+}
+
+func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 
 	file, header, err := r.FormFile("file")
 
@@ -54,6 +91,12 @@ func (c *httpClient) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) 
 	}
 
 	nodes, err := c.calculateNodesUsage()
+
+	h := sha256.New()
+
+	h.Write([]byte(header.Filename))
+
+	bs := h.Sum(nil)
 
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -91,33 +134,39 @@ func (c *httpClient) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 
-		_, err = c.client.Post(fmt.Sprintf(addr.address+"/receiveFile"), writer.FormDataContentType(), &buf)
+		err = c.redisClient.Set(context.Background(), fmt.Sprintf("%x", bs), addr.address, 0).Err()
+
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		_, err = c.httpClient.Post(fmt.Sprintf(addr.address+"/receiveFile"), writer.FormDataContentType(), &buf)
 
 		if err != nil {
 			w.WriteHeader(http.StatusRequestTimeout)
+			return
 		}
 	}
 	w.WriteHeader(http.StatusOK)
 }
 
-func (c *httpClient) calculateNodesUsage() ([]nodeWithUsage, error) {
+func (c *clients) calculateNodesUsage() ([]nodeWithUsage, error) {
 	addresses := []string{
 		"http://localhost:8080",
 		"http://localhost:8081",
 		"http://localhost:8082",
-		"http://localhost:8083",
 	}
 
 	var nodes []nodeWithUsage
 
 	for _, addr := range addresses {
-		resp, err := c.client.Get(fmt.Sprintf("%s/%s", addr, "/getCurrentNodeSpace"))
+		resp, err := c.httpClient.Get(fmt.Sprintf("%s/%s", addr, "/getCurrentNodeSpace"))
+		defer resp.Body.Close()
 
 		if err != nil {
 			continue
 		}
-
-		defer resp.Body.Close()
 
 		var nodeResp nodeResponse
 
@@ -139,7 +188,7 @@ func (c *httpClient) calculateNodesUsage() ([]nodeWithUsage, error) {
 
 	return nodes, nil
 }
-func (c *httpClient) nodesWithUsage(w http.ResponseWriter, r *http.Request) {
+func (c *clients) nodesWithUsage(w http.ResponseWriter, r *http.Request) {
 	nodes, err := c.calculateNodesUsage()
 
 	if err != nil {
@@ -165,10 +214,20 @@ type nodeResponse struct {
 	Size float64 `json:"Size"`
 }
 
-type httpClient struct {
-	client http.Client
+type clients struct {
+	httpClient  http.Client
+	redisClient *redis.Client
 }
 
 func newHttpClient() http.Client {
 	return http.Client{Timeout: time.Duration(5) * time.Second}
+}
+
+func newRedisClient() *redis.Client {
+	return redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "",
+		DB:       0,
+		Protocol: 2,
+	})
 }
