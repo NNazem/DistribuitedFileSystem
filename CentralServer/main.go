@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"time"
 )
 
@@ -44,11 +46,7 @@ func main() {
 func (c *clients) RetrieveFile(w http.ResponseWriter, r *http.Request) {
 	fileName := r.URL.Query().Get("fileName")
 
-	h := sha256.New()
-
-	h.Write([]byte(fileName))
-
-	bs := h.Sum(nil)
+	bs := c.hashFileName(fileName)
 
 	node := c.redisClient.Get(context.Background(), fmt.Sprintf("%x", bs))
 
@@ -73,6 +71,15 @@ func (c *clients) RetrieveFile(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (c *clients) hashFileName(fileName string) []byte {
+	h := sha256.New()
+
+	h.Write([]byte(fileName))
+
+	bs := h.Sum(nil)
+	return bs
+}
+
 func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 
 	file, header, err := r.FormFile("file")
@@ -90,62 +97,77 @@ func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	nodes, err := c.calculateNodesUsage()
+	listOfBlocks := c.divideFileInBlocks(body)
 
-	h := sha256.New()
+	currentBlock := 1
 
-	h.Write([]byte(header.Filename))
+	for listOfBlocks.Len() > 0 {
 
-	bs := h.Sum(nil)
+		block := listOfBlocks.Front()
+		listOfBlocks.Remove(block)
+		blockByte, ok := block.Value.([]byte)
 
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(err.Error())
-		return
-	}
-
-	for _, addr := range nodes[:1] {
-		if addr.usage > 1 {
+		if !ok {
 			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode("All the nodes are currently full. Please try again later.")
-			return
-		}
-		var buf bytes.Buffer
-		writer := multipart.NewWriter(&buf)
-
-		part, err := writer.CreateFormFile("file", header.Filename)
-
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode("The server couldn't divide the file in blocks. Please try again later.")
 			return
 		}
 
-		_, err = part.Write(body)
+		nodes, err := c.calculateNodesUsage()
+
+		bs := c.hashFileName(header.Filename + "-block" + strconv.Itoa(currentBlock))
 
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(err.Error())
 			return
 		}
 
-		err = writer.Close()
+		for _, addr := range nodes[:1] {
+			if addr.usage > 1 {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode("All the nodes are currently full. Please try again later.")
+				return
+			}
+			var buf bytes.Buffer
+			writer := multipart.NewWriter(&buf)
 
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
+			fileName := header.Filename + "-block-" + strconv.Itoa(currentBlock) + ".bin"
+			part, err := writer.CreateFormFile("file", fileName)
+			currentBlock++
 
-		err = c.redisClient.Set(context.Background(), fmt.Sprintf("%x", bs), addr.address, 0).Err()
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
+			_, err = part.Write(blockByte)
 
-		_, err = c.httpClient.Post(fmt.Sprintf(addr.address+"/receiveFile"), writer.FormDataContentType(), &buf)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 
-		if err != nil {
-			w.WriteHeader(http.StatusRequestTimeout)
-			return
+			err = writer.Close()
+
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			err = c.redisClient.Set(context.Background(), fmt.Sprintf("%x", bs), addr.address, 0).Err()
+
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			_, err = c.httpClient.Post(fmt.Sprintf(addr.address+"/receiveFile"), writer.FormDataContentType(), &buf)
+
+			if err != nil {
+				w.WriteHeader(http.StatusRequestTimeout)
+				return
+			}
 		}
 	}
 	w.WriteHeader(http.StatusOK)
@@ -156,6 +178,9 @@ func (c *clients) calculateNodesUsage() ([]nodeWithUsage, error) {
 		"http://localhost:8080",
 		"http://localhost:8081",
 		"http://localhost:8082",
+		"http://localhost:8083",
+		"http://localhost:8084",
+		"http://localhost:8085",
 	}
 
 	var nodes []nodeWithUsage
@@ -203,6 +228,25 @@ func (c *clients) nodesWithUsage(w http.ResponseWriter, r *http.Request) {
 			tmp.address: float64(tmp.usage),
 		})
 	}
+}
+
+func (c *clients) divideFileInBlocks(file []byte) *list.List {
+	numOfBlocks := len(file) / (64 * MB)
+	listOfBlocks := list.New()
+
+	if numOfBlocks == 0 {
+		listOfBlocks.PushBack(file)
+		return listOfBlocks
+	} else {
+		for i := range numOfBlocks {
+			tmpBlock := file[(64*MB)*i : ((64*MB)*i)+64*MB]
+			listOfBlocks.PushBack(tmpBlock)
+		}
+		listOfBlocks.PushBack(file[((64 * MB) * numOfBlocks):])
+
+	}
+
+	return listOfBlocks
 }
 
 type nodeWithUsage struct {
