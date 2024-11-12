@@ -23,7 +23,5 @@ Implemented Features
   	•	The system monitors each node’s available storage and uses this data to balance the load efficiently.
 	Node Services for File Handling
 	  •	Each node provides endpoints to receive, retrieve, and check for file existence, as well as calculate storage usage.
-	HTTP Client Timeout Configuration
-	  •	The central server uses a 5-second timeout on HTTP requests to nodes, improving resilience in case of unresponsive nodes.
 
 This setup provides a simple but effective distributed system, with centralized file management and fault tolerance facilitated through Redis.
