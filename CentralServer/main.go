@@ -26,6 +26,8 @@ const maxNodeSize = 128 * MB
 
 const MB = 1024 * 1024
 
+const KB = 1024
+
 func main() {
 
 	clients := &clients{httpClient: newHttpClient(), redisClient: newRedisClient()}
@@ -46,29 +48,35 @@ func main() {
 func (c *clients) RetrieveFile(w http.ResponseWriter, r *http.Request) {
 	fileName := r.URL.Query().Get("fileName")
 
-	bs := c.hashFileName(fileName)
+	bytes := c.recomposeFile(fileName)
 
-	node := c.redisClient.Get(context.Background(), fmt.Sprintf("%x", bs))
+	w.Write(bytes)
+	w.WriteHeader(http.StatusOK)
+}
 
-	res, err := c.httpClient.Get(fmt.Sprintf("%s/%s?filename=%s", node.Val(), "/retrieveFile", fileName))
+func (c *clients) recomposeFile(filename string) []byte {
+	bs := c.hashFileName(filename)
+	var fileBytes []byte
 
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
+	numOfBlocks, _ := strconv.Atoi(c.redisClient.Get(context.Background(), fmt.Sprintf("%x", bs)).Val())
 
-	if http.StatusOK == res.StatusCode {
+	for i := range numOfBlocks {
+		fileBlockName := filename + "-block-" + strconv.Itoa(i+1)
+		bs := c.hashFileName(fileBlockName)
+
+		node := c.redisClient.Get(context.Background(), fmt.Sprintf("%x", bs)).Val()
+
+		res, _ := c.httpClient.Get(fmt.Sprintf("%s/%s?filename=%s", node, "/retrieveFile", fileBlockName+".bin"))
+
 		body := res.Body
 		defer body.Close()
 
-		content, err := io.ReadAll(body)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-		}
+		bodyByte, _ := io.ReadAll(body)
 
-		w.Write(content)
-		w.WriteHeader(res.StatusCode)
+		fileBytes = append(fileBytes, bodyByte...)
 	}
+
+	return fileBytes
 }
 
 func (c *clients) hashFileName(fileName string) []byte {
@@ -99,6 +107,15 @@ func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 
 	listOfBlocks := c.divideFileInBlocks(body)
 
+	hashedFileName := c.hashFileName(header.Filename)
+
+	err = c.redisClient.Set(context.Background(), fmt.Sprintf("%x", hashedFileName), listOfBlocks.Len(), 0).Err()
+
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode("Error converting the filename to hash.")
+	}
+
 	currentBlock := 1
 
 	for listOfBlocks.Len() > 0 {
@@ -115,7 +132,7 @@ func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 
 		nodes, err := c.calculateNodesUsage()
 
-		bs := c.hashFileName(header.Filename + "-block" + strconv.Itoa(currentBlock))
+		bs := c.hashFileName(header.Filename + "-block-" + strconv.Itoa(currentBlock))
 
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -231,7 +248,7 @@ func (c *clients) nodesWithUsage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *clients) divideFileInBlocks(file []byte) *list.List {
-	numOfBlocks := len(file) / (64 * MB)
+	numOfBlocks := len(file) / (256 * KB)
 	listOfBlocks := list.New()
 
 	if numOfBlocks == 0 {
@@ -239,10 +256,10 @@ func (c *clients) divideFileInBlocks(file []byte) *list.List {
 		return listOfBlocks
 	} else {
 		for i := range numOfBlocks {
-			tmpBlock := file[(64*MB)*i : ((64*MB)*i)+64*MB]
+			tmpBlock := file[(64*KB)*i : ((64*KB)*i)+64*KB]
 			listOfBlocks.PushBack(tmpBlock)
 		}
-		listOfBlocks.PushBack(file[((64 * MB) * numOfBlocks):])
+		listOfBlocks.PushBack(file[((64 * KB) * numOfBlocks):])
 
 	}
 
