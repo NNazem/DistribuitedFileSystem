@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"container/list"
 	"context"
 	"crypto/sha256"
@@ -17,6 +18,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -50,8 +52,8 @@ func (c *clients) RetrieveFile(w http.ResponseWriter, r *http.Request) {
 
 	bytes := c.recomposeFile(fileName)
 
-	w.Write(bytes)
 	w.WriteHeader(http.StatusOK)
+	w.Write(bytes)
 }
 
 func (c *clients) recomposeFile(filename string) []byte {
@@ -76,7 +78,14 @@ func (c *clients) recomposeFile(filename string) []byte {
 		fileBytes = append(fileBytes, bodyByte...)
 	}
 
-	return fileBytes
+	reader := bytes.NewReader(fileBytes)
+
+	gz, _ := gzip.NewReader(reader)
+	defer gz.Close()
+
+	decompressedBytes, _ := io.ReadAll(gz)
+
+	return decompressedBytes
 }
 
 func (c *clients) hashFileName(fileName string) []byte {
@@ -89,7 +98,6 @@ func (c *clients) hashFileName(fileName string) []byte {
 }
 
 func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
-
 	file, header, err := r.FormFile("file")
 
 	if err != nil {
@@ -105,7 +113,23 @@ func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	listOfBlocks := c.divideFileInBlocks(body)
+	var zipBuf bytes.Buffer
+
+	gz := gzip.NewWriter(&zipBuf)
+
+	if _, err := gz.Write(body); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if err := gz.Close(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	compressedData := zipBuf.Bytes()
+
+	listOfBlocks := c.divideFileInBlocks(compressedData)
 
 	hashedFileName := c.hashFileName(header.Filename)
 
@@ -116,77 +140,83 @@ func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode("Error converting the filename to hash.")
 	}
 
-	currentBlock := 1
+	wg := sync.WaitGroup{}
+	errChan := make(chan error, listOfBlocks.Len())
 
 	for listOfBlocks.Len() > 0 {
 
 		block := listOfBlocks.Front()
 		listOfBlocks.Remove(block)
-		blockByte, ok := block.Value.([]byte)
+		wg.Add(1)
 
-		if !ok {
+		go func(block BlockStruct) {
+			defer wg.Done()
+			nodes, err := c.calculateNodesUsage()
+
+			if err != nil {
+				errChan <- err
+				return
+			}
+
+			bs := c.hashFileName(header.Filename + "-block-" + strconv.Itoa(block.position))
+
+			for _, addr := range nodes[:1] {
+				if addr.usage > 1 {
+					errChan <- errors.New("All the nodes are currently full. Please try again later.")
+					return
+				}
+				var buf bytes.Buffer
+				writer := multipart.NewWriter(&buf)
+
+				fileName := header.Filename + "-block-" + strconv.Itoa(block.position) + ".bin"
+				part, err := writer.CreateFormFile("file", fileName)
+
+				if err != nil {
+					errChan <- errors.New("The server couldn't create the form file. Please try again later.")
+					return
+				}
+
+				_, err = part.Write(block.bytes)
+
+				if err != nil {
+					errChan <- errors.New("The server couldn't write the file data to the response. Please try again later.")
+					return
+				}
+
+				err = writer.Close()
+
+				if err != nil {
+					errChan <- errors.New("The server couldn't close the writer. Please try again later")
+					return
+				}
+
+				err = c.redisClient.Set(context.Background(), fmt.Sprintf("%x", bs), addr.address, 0).Err()
+
+				if err != nil {
+					errChan <- errors.New("The server couldn't communicate con redis. Please try again later.")
+					return
+				}
+
+				_, err = c.httpClient.Post(fmt.Sprintf(addr.address+"/receiveFile"), writer.FormDataContentType(), &buf)
+
+				if err != nil {
+					errChan <- errors.New("The server couldn't communicate with the node. Please try again later")
+					return
+				}
+			}
+		}(block.Value.(BlockStruct))
+		wg.Wait()
+	}
+
+	close(errChan)
+
+	for err := range errChan {
+		if err != nil && err.Error() != "" {
 			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode("The server couldn't divide the file in blocks. Please try again later.")
 			return
-		}
-
-		nodes, err := c.calculateNodesUsage()
-
-		bs := c.hashFileName(header.Filename + "-block-" + strconv.Itoa(currentBlock))
-
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(err.Error())
-			return
-		}
-
-		for _, addr := range nodes[:1] {
-			if addr.usage > 1 {
-				w.WriteHeader(http.StatusInternalServerError)
-				json.NewEncoder(w).Encode("All the nodes are currently full. Please try again later.")
-				return
-			}
-			var buf bytes.Buffer
-			writer := multipart.NewWriter(&buf)
-
-			fileName := header.Filename + "-block-" + strconv.Itoa(currentBlock) + ".bin"
-			part, err := writer.CreateFormFile("file", fileName)
-			currentBlock++
-
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-
-			_, err = part.Write(blockByte)
-
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-
-			err = writer.Close()
-
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-
-			err = c.redisClient.Set(context.Background(), fmt.Sprintf("%x", bs), addr.address, 0).Err()
-
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-
-			_, err = c.httpClient.Post(fmt.Sprintf(addr.address+"/receiveFile"), writer.FormDataContentType(), &buf)
-
-			if err != nil {
-				w.WriteHeader(http.StatusRequestTimeout)
-				return
-			}
 		}
 	}
+
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -221,7 +251,7 @@ func (c *clients) calculateNodesUsage() ([]nodeWithUsage, error) {
 	}
 
 	if len(nodes) == 0 {
-		return nodes, errors.New("All the nodes are currently unavailable. Please try again later.")
+		return nil, errors.New("All the nodes are currently unavailable. Please try again later.")
 	}
 
 	sort.Slice(nodes, func(i, j int) bool {
@@ -248,22 +278,28 @@ func (c *clients) nodesWithUsage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *clients) divideFileInBlocks(file []byte) *list.List {
-	numOfBlocks := len(file) / (256 * KB)
+
+	maxBlockSize := 128 * MB
+	numOfBlocks := len(file) / maxBlockSize
 	listOfBlocks := list.New()
 
 	if numOfBlocks == 0 {
-		listOfBlocks.PushBack(file)
+		listOfBlocks.PushBack(BlockStruct{bytes: file, position: 1})
 		return listOfBlocks
 	} else {
 		for i := range numOfBlocks {
-			tmpBlock := file[(64*KB)*i : ((64*KB)*i)+64*KB]
-			listOfBlocks.PushBack(tmpBlock)
+			tmpBlock := file[maxBlockSize*i : (maxBlockSize*i)+maxBlockSize]
+			listOfBlocks.PushBack(BlockStruct{bytes: tmpBlock, position: i + 1})
 		}
-		listOfBlocks.PushBack(file[((64 * KB) * numOfBlocks):])
-
+		listOfBlocks.PushBack(BlockStruct{bytes: file[(maxBlockSize * numOfBlocks):], position: numOfBlocks + 1})
 	}
 
 	return listOfBlocks
+}
+
+type BlockStruct struct {
+	bytes    []byte
+	position int
 }
 
 type nodeWithUsage struct {
