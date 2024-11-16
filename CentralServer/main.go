@@ -30,6 +30,40 @@ const MB = 1024 * 1024
 
 const KB = 1024
 
+type BlockStruct struct {
+	bytes    []byte
+	position int
+}
+
+type nodeWithUsage struct {
+	address string
+	usage   int
+}
+
+type nodeResponse struct {
+	Size int `json:"Size"`
+}
+
+type clients struct {
+	httpClient  http.Client
+	redisClient *redis.Client
+	nodes       []nodeWithUsage
+	mutex       sync.Mutex
+}
+
+func newHttpClient() http.Client {
+	return http.Client{Timeout: time.Duration(5) * time.Second}
+}
+
+func newRedisClient() *redis.Client {
+	return redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "",
+		DB:       0,
+		Protocol: 2,
+	})
+}
+
 func main() {
 	clients := &clients{httpClient: newHttpClient(), redisClient: newRedisClient()}
 
@@ -91,15 +125,6 @@ func (c *clients) recomposeFile(filename string) []byte {
 	return decompressedBytes
 }
 
-func (c *clients) hashFileName(fileName string) []byte {
-	h := sha256.New()
-
-	h.Write([]byte(fileName))
-
-	bs := h.Sum(nil)
-	return bs
-}
-
 func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 	file, header, err := r.FormFile("file")
 
@@ -146,6 +171,15 @@ func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 	wg := sync.WaitGroup{}
 	errChan := make(chan error, listOfBlocks.Len())
 
+	nodesRes, err := c.calculateNodesUsage()
+
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode("Error retrieving space from nodes.")
+	}
+
+	c.nodes = nodesRes
+
 	for listOfBlocks.Len() > 0 {
 
 		block := listOfBlocks.Front()
@@ -155,8 +189,9 @@ func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 		go func(block BlockStruct) {
 			c.sendBlock(block, &wg, errChan, header)
 		}(block.Value.(BlockStruct))
-		wg.Wait()
 	}
+
+	wg.Wait()
 
 	close(errChan)
 
@@ -172,59 +207,60 @@ func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 
 func (c *clients) sendBlock(block BlockStruct, wg *sync.WaitGroup, errChan chan error, header *multipart.FileHeader) {
 	defer wg.Done()
-	nodes, err := c.calculateNodesUsage()
 
-	if err != nil {
-		errChan <- err
-		return
-	}
+	c.mutex.Lock()
+	selectedNode := c.nodes[0]
+	c.nodes[0].usage = selectedNode.usage + len(block.bytes)
+	sort.Slice(c.nodes, func(i, j int) bool {
+		return c.nodes[i].usage < c.nodes[j].usage
+	})
+	c.mutex.Unlock()
 
 	bs := c.hashFileName(header.Filename + "-block-" + strconv.Itoa(block.position))
 
-	for _, addr := range nodes[:1] {
-		if addr.usage > 1 {
-			errChan <- errors.New("All the nodes are currently full. Please try again later.")
-			return
-		}
-		var buf bytes.Buffer
-		writer := multipart.NewWriter(&buf)
-
-		fileName := header.Filename + "-block-" + strconv.Itoa(block.position) + ".bin"
-		part, err := writer.CreateFormFile("file", fileName)
-
-		if err != nil {
-			errChan <- errors.New("The server couldn't create the form file. Please try again later.")
-			return
-		}
-
-		_, err = part.Write(block.bytes)
-
-		if err != nil {
-			errChan <- errors.New("The server couldn't write the file data to the response. Please try again later.")
-			return
-		}
-
-		err = writer.Close()
-
-		if err != nil {
-			errChan <- errors.New("The server couldn't close the writer. Please try again later")
-			return
-		}
-
-		err = c.redisClient.Set(context.Background(), fmt.Sprintf("%x", bs), addr.address, 0).Err()
-
-		if err != nil {
-			errChan <- errors.New("The server couldn't communicate con redis. Please try again later.")
-			return
-		}
-
-		_, err = c.httpClient.Post(fmt.Sprintf(addr.address+"/receiveFile"), writer.FormDataContentType(), &buf)
-
-		if err != nil {
-			errChan <- errors.New("The server couldn't communicate with the node. Please try again later")
-			return
-		}
+	if selectedNode.usage > 2*maxNodeSize {
+		errChan <- errors.New("All the nodes are currently full. Please try again later.")
+		return
 	}
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	fileName := header.Filename + "-block-" + strconv.Itoa(block.position) + ".bin"
+	part, err := writer.CreateFormFile("file", fileName)
+
+	if err != nil {
+		errChan <- errors.New("The server couldn't create the form file. Please try again later.")
+		return
+	}
+
+	_, err = part.Write(block.bytes)
+
+	if err != nil {
+		errChan <- errors.New("The server couldn't write the file data to the response. Please try again later.")
+		return
+	}
+
+	err = writer.Close()
+
+	if err != nil {
+		errChan <- errors.New("The server couldn't close the writer. Please try again later")
+		return
+	}
+
+	err = c.redisClient.Set(context.Background(), fmt.Sprintf("%x", bs), selectedNode.address, 0).Err()
+
+	if err != nil {
+		errChan <- errors.New("The server couldn't communicate con redis. Please try again later.")
+		return
+	}
+
+	_, err = c.httpClient.Post(fmt.Sprintf(selectedNode.address+"/receiveFile"), writer.FormDataContentType(), &buf)
+
+	if err != nil {
+		errChan <- errors.New("The server couldn't communicate with the node. Please try again later")
+		return
+	}
+
 }
 
 func (c *clients) calculateNodesUsage() ([]nodeWithUsage, error) {
@@ -253,7 +289,7 @@ func (c *clients) calculateNodesUsage() ([]nodeWithUsage, error) {
 
 		nodes = append(nodes, nodeWithUsage{
 			address: addr,
-			usage:   float64(nodeResp.Size / maxNodeSize),
+			usage:   nodeResp.Size,
 		})
 	}
 
@@ -304,34 +340,11 @@ func (c *clients) divideFileInBlocks(file []byte) *list.List {
 	return listOfBlocks
 }
 
-type BlockStruct struct {
-	bytes    []byte
-	position int
-}
+func (c *clients) hashFileName(fileName string) []byte {
+	h := sha256.New()
 
-type nodeWithUsage struct {
-	address string
-	usage   float64
-}
+	h.Write([]byte(fileName))
 
-type nodeResponse struct {
-	Size float64 `json:"Size"`
-}
-
-type clients struct {
-	httpClient  http.Client
-	redisClient *redis.Client
-}
-
-func newHttpClient() http.Client {
-	return http.Client{Timeout: time.Duration(5) * time.Second}
-}
-
-func newRedisClient() *redis.Client {
-	return redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       0,
-		Protocol: 2,
-	})
+	bs := h.Sum(nil)
+	return bs
 }
