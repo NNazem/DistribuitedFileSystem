@@ -31,7 +31,6 @@ const MB = 1024 * 1024
 const KB = 1024
 
 func main() {
-
 	clients := &clients{httpClient: newHttpClient(), redisClient: newRedisClient()}
 
 	routerHttp := mux.NewRouter()
@@ -50,10 +49,14 @@ func main() {
 func (c *clients) RetrieveFile(w http.ResponseWriter, r *http.Request) {
 	fileName := r.URL.Query().Get("fileName")
 
-	bytes := c.recomposeFile(fileName)
+	recompesedBytes := c.recomposeFile(fileName)
 
+	_, err := w.Write(recompesedBytes)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
-	w.Write(bytes)
 }
 
 func (c *clients) recomposeFile(filename string) []byte {
@@ -150,60 +153,7 @@ func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 
 		go func(block BlockStruct) {
-			defer wg.Done()
-			nodes, err := c.calculateNodesUsage()
-
-			if err != nil {
-				errChan <- err
-				return
-			}
-
-			bs := c.hashFileName(header.Filename + "-block-" + strconv.Itoa(block.position))
-
-			for _, addr := range nodes[:1] {
-				if addr.usage > 1 {
-					errChan <- errors.New("All the nodes are currently full. Please try again later.")
-					return
-				}
-				var buf bytes.Buffer
-				writer := multipart.NewWriter(&buf)
-
-				fileName := header.Filename + "-block-" + strconv.Itoa(block.position) + ".bin"
-				part, err := writer.CreateFormFile("file", fileName)
-
-				if err != nil {
-					errChan <- errors.New("The server couldn't create the form file. Please try again later.")
-					return
-				}
-
-				_, err = part.Write(block.bytes)
-
-				if err != nil {
-					errChan <- errors.New("The server couldn't write the file data to the response. Please try again later.")
-					return
-				}
-
-				err = writer.Close()
-
-				if err != nil {
-					errChan <- errors.New("The server couldn't close the writer. Please try again later")
-					return
-				}
-
-				err = c.redisClient.Set(context.Background(), fmt.Sprintf("%x", bs), addr.address, 0).Err()
-
-				if err != nil {
-					errChan <- errors.New("The server couldn't communicate con redis. Please try again later.")
-					return
-				}
-
-				_, err = c.httpClient.Post(fmt.Sprintf(addr.address+"/receiveFile"), writer.FormDataContentType(), &buf)
-
-				if err != nil {
-					errChan <- errors.New("The server couldn't communicate with the node. Please try again later")
-					return
-				}
-			}
+			c.sendBlock(block, &wg, errChan, header)
 		}(block.Value.(BlockStruct))
 		wg.Wait()
 	}
@@ -218,6 +168,63 @@ func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+func (c *clients) sendBlock(block BlockStruct, wg *sync.WaitGroup, errChan chan error, header *multipart.FileHeader) {
+	defer wg.Done()
+	nodes, err := c.calculateNodesUsage()
+
+	if err != nil {
+		errChan <- err
+		return
+	}
+
+	bs := c.hashFileName(header.Filename + "-block-" + strconv.Itoa(block.position))
+
+	for _, addr := range nodes[:1] {
+		if addr.usage > 1 {
+			errChan <- errors.New("All the nodes are currently full. Please try again later.")
+			return
+		}
+		var buf bytes.Buffer
+		writer := multipart.NewWriter(&buf)
+
+		fileName := header.Filename + "-block-" + strconv.Itoa(block.position) + ".bin"
+		part, err := writer.CreateFormFile("file", fileName)
+
+		if err != nil {
+			errChan <- errors.New("The server couldn't create the form file. Please try again later.")
+			return
+		}
+
+		_, err = part.Write(block.bytes)
+
+		if err != nil {
+			errChan <- errors.New("The server couldn't write the file data to the response. Please try again later.")
+			return
+		}
+
+		err = writer.Close()
+
+		if err != nil {
+			errChan <- errors.New("The server couldn't close the writer. Please try again later")
+			return
+		}
+
+		err = c.redisClient.Set(context.Background(), fmt.Sprintf("%x", bs), addr.address, 0).Err()
+
+		if err != nil {
+			errChan <- errors.New("The server couldn't communicate con redis. Please try again later.")
+			return
+		}
+
+		_, err = c.httpClient.Post(fmt.Sprintf(addr.address+"/receiveFile"), writer.FormDataContentType(), &buf)
+
+		if err != nil {
+			errChan <- errors.New("The server couldn't communicate with the node. Please try again later")
+			return
+		}
+	}
 }
 
 func (c *clients) calculateNodesUsage() ([]nodeWithUsage, error) {
