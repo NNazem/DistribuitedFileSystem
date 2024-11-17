@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	"container/list"
 	"context"
 	"crypto/sha256"
@@ -10,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/gorilla/mux"
+	pgzip "github.com/klauspost/pgzip"
 	"github.com/redis/go-redis/v9"
 	"io"
 	"io/ioutil"
@@ -117,7 +117,7 @@ func (c *clients) recomposeFile(filename string) []byte {
 
 	reader := bytes.NewReader(fileBytes)
 
-	gz, _ := gzip.NewReader(reader)
+	gz, _ := pgzip.NewReader(reader)
 	defer gz.Close()
 
 	decompressedBytes, _ := io.ReadAll(gz)
@@ -143,7 +143,14 @@ func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 
 	var zipBuf bytes.Buffer
 
-	gz := gzip.NewWriter(&zipBuf)
+	gz := pgzip.NewWriter(&zipBuf)
+
+	err = gz.SetConcurrency(100000, 10)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(err.Error())
+		return
+	}
 
 	if _, err := gz.Write(body); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
