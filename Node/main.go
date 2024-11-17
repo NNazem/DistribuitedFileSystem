@@ -15,6 +15,7 @@ import (
 func main() {
 	routerHttp := mux.NewRouter()
 
+	routerHttp.HandleFunc("/health", currentHealth).Methods("GET")
 	routerHttp.HandleFunc("/receiveFile", receiveFile).Methods("POST")
 	routerHttp.HandleFunc("/retrieveFile", retrieveFile).Methods("GET")
 	routerHttp.HandleFunc("/checkIfFileExists", checkIfFileExists).Methods("GET")
@@ -27,6 +28,11 @@ func main() {
 	if err != nil {
 		os.Exit(-1)
 	}
+}
+
+func currentHealth(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	return
 }
 
 func receiveFile(w http.ResponseWriter, r *http.Request) {

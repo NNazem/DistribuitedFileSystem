@@ -15,6 +15,7 @@ import (
 	"io/ioutil"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -44,9 +45,14 @@ type nodeResponse struct {
 	Size int `json:"Size"`
 }
 
+type addNodeRequest struct {
+	Url string `json:"Url"`
+}
+
 type clients struct {
 	httpClient  http.Client
 	redisClient *redis.Client
+	nodesList   []string
 	nodes       []nodeWithUsage
 	mutex       sync.Mutex
 }
@@ -72,12 +78,48 @@ func main() {
 	routerHttp.HandleFunc("/sendFile", clients.ReceiveFileAndSend).Methods("POST")
 	routerHttp.HandleFunc("/nodesUsage", clients.nodesWithUsage).Methods("GET")
 	routerHttp.HandleFunc("/retrieveFile", clients.RetrieveFile).Methods("GET")
+	routerHttp.HandleFunc("/addNode", clients.AddNewNode).Methods("POST")
 
 	err := http.ListenAndServe(fmt.Sprintf(":%d", serverPort), routerHttp)
 
 	if err != nil {
 		os.Exit(-1)
 	}
+}
+
+func (c *clients) AddNewNode(w http.ResponseWriter, r *http.Request) {
+	var node addNodeRequest
+	err := json.NewDecoder(r.Body).Decode(&node)
+
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode("Please send a valid request")
+	}
+
+	u, err := url.ParseRequestURI(node.Url)
+
+	if err != nil || u == nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode("Please send a valid URL")
+		return
+	}
+
+	res, err := http.Get(u.String() + "/health")
+
+	if err != nil || res.StatusCode != 200 {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode("The new node  cannot be verified. Please try again later.")
+		return
+	}
+
+	c.mutex.Lock()
+	c.nodesList = append(c.nodesList, u.String())
+	nodesWithUsage, err := c.calculateNodesUsage()
+	if err == nil {
+		c.nodes = nodesWithUsage
+	}
+	c.mutex.Unlock()
+	w.WriteHeader(http.StatusOK)
 }
 
 func (c *clients) RetrieveFile(w http.ResponseWriter, r *http.Request) {
