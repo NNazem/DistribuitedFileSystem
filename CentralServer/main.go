@@ -31,30 +31,30 @@ const MB = 1024 * 1024
 
 const KB = 1024
 
-type BlockStruct struct {
+type FileBlock struct {
 	bytes    []byte
 	position int
 }
 
-type nodeWithUsage struct {
+type NodeUsage struct {
 	address string
 	usage   int
 }
 
-type nodeResponse struct {
+type NodeUsageResponse struct {
 	Size int `json:"Size"`
 }
 
-type addNodeRequest struct {
+type NodeRegistrationRequest struct {
 	Url string `json:"Url"`
 }
 
 type clients struct {
-	httpClient  http.Client
-	redisClient *redis.Client
-	nodesList   []string
-	nodes       []nodeWithUsage
-	mutex       sync.Mutex
+	httpClient    http.Client
+	redisClient   *redis.Client
+	NodeAddresses []string
+	NodeStats     []NodeUsage
+	mutex         sync.Mutex
 }
 
 func newHttpClient() http.Client {
@@ -75,10 +75,10 @@ func main() {
 
 	routerHttp := mux.NewRouter()
 
-	routerHttp.HandleFunc("/sendFile", clients.ReceiveFileAndSend).Methods("POST")
-	routerHttp.HandleFunc("/nodesUsage", clients.nodesWithUsage).Methods("GET")
-	routerHttp.HandleFunc("/retrieveFile", clients.RetrieveFile).Methods("GET")
-	routerHttp.HandleFunc("/addNode", clients.AddNewNode).Methods("POST")
+	routerHttp.HandleFunc("/sendFile", clients.UploadAndDistributeFile).Methods("POST")
+	routerHttp.HandleFunc("/nodesUsage", clients.GetNodeUsage).Methods("GET")
+	routerHttp.HandleFunc("/retrieveFile", clients.DownloadFile).Methods("GET")
+	routerHttp.HandleFunc("/addNode", clients.RegisterNode).Methods("POST")
 
 	err := http.ListenAndServe(fmt.Sprintf(":%d", serverPort), routerHttp)
 
@@ -87,8 +87,8 @@ func main() {
 	}
 }
 
-func (c *clients) AddNewNode(w http.ResponseWriter, r *http.Request) {
-	var node addNodeRequest
+func (c *clients) RegisterNode(w http.ResponseWriter, r *http.Request) {
+	var node NodeRegistrationRequest
 	err := json.NewDecoder(r.Body).Decode(&node)
 
 	if err != nil {
@@ -113,19 +113,19 @@ func (c *clients) AddNewNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c.mutex.Lock()
-	c.nodesList = append(c.nodesList, u.String())
-	nodesWithUsage, err := c.calculateNodesUsage()
+	c.NodeAddresses = append(c.NodeAddresses, u.String())
+	nodesWithUsage, err := c.FetchNodeUsageStats()
 	if err == nil {
-		c.nodes = nodesWithUsage
+		c.NodeStats = nodesWithUsage
 	}
 	c.mutex.Unlock()
 	w.WriteHeader(http.StatusOK)
 }
 
-func (c *clients) RetrieveFile(w http.ResponseWriter, r *http.Request) {
+func (c *clients) DownloadFile(w http.ResponseWriter, r *http.Request) {
 	fileName := r.URL.Query().Get("fileName")
 
-	recompesedBytes := c.recomposeFile(fileName)
+	recompesedBytes := c.ReassembleFile(fileName)
 
 	_, err := w.Write(recompesedBytes)
 	if err != nil {
@@ -135,15 +135,15 @@ func (c *clients) RetrieveFile(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (c *clients) recomposeFile(filename string) []byte {
-	bs := c.hashFileName(filename)
+func (c *clients) ReassembleFile(filename string) []byte {
+	bs := c.GenerateFileHash(filename)
 	var fileBytes []byte
 
 	numOfBlocks, _ := strconv.Atoi(c.redisClient.Get(context.Background(), fmt.Sprintf("%x", bs)).Val())
 
 	for i := range numOfBlocks {
 		fileBlockName := filename + "-block-" + strconv.Itoa(i+1)
-		bs := c.hashFileName(fileBlockName)
+		bs := c.GenerateFileHash(fileBlockName)
 
 		node := c.redisClient.Get(context.Background(), fmt.Sprintf("%x", bs)).Val()
 
@@ -167,7 +167,7 @@ func (c *clients) recomposeFile(filename string) []byte {
 	return decompressedBytes
 }
 
-func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
+func (c *clients) UploadAndDistributeFile(w http.ResponseWriter, r *http.Request) {
 	file, header, err := r.FormFile("file")
 
 	if err != nil {
@@ -183,9 +183,9 @@ func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var zipBuf bytes.Buffer
+	var CompressedBuffer bytes.Buffer
 
-	gz := pgzip.NewWriter(&zipBuf)
+	gz := pgzip.NewWriter(&CompressedBuffer)
 
 	err = gz.SetConcurrency(100000, 10)
 	if err != nil {
@@ -204,11 +204,11 @@ func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	compressedData := zipBuf.Bytes()
+	compressedData := CompressedBuffer.Bytes()
 
-	listOfBlocks := c.divideFileInBlocks(compressedData)
+	listOfBlocks := c.SplitFileIntoBlocks(compressedData)
 
-	hashedFileName := c.hashFileName(header.Filename)
+	hashedFileName := c.GenerateFileHash(header.Filename)
 
 	err = c.redisClient.Set(context.Background(), fmt.Sprintf("%x", hashedFileName), listOfBlocks.Len(), 0).Err()
 
@@ -218,16 +218,16 @@ func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	wg := sync.WaitGroup{}
-	errChan := make(chan error, listOfBlocks.Len())
+	ErrorChannel := make(chan error, listOfBlocks.Len())
 
-	nodesRes, err := c.calculateNodesUsage()
+	nodesRes, err := c.FetchNodeUsageStats()
 
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode("Error retrieving space from nodes.")
+		json.NewEncoder(w).Encode("Error retrieving space from NodeStats.")
 	}
 
-	c.nodes = nodesRes
+	c.NodeStats = nodesRes
 
 	for listOfBlocks.Len() > 0 {
 
@@ -235,16 +235,16 @@ func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 		listOfBlocks.Remove(block)
 		wg.Add(1)
 
-		go func(block BlockStruct) {
-			c.sendBlock(block, &wg, errChan, header)
-		}(block.Value.(BlockStruct))
+		go func(block FileBlock) {
+			c.DistributeBlock(block, &wg, ErrorChannel, header)
+		}(block.Value.(FileBlock))
 	}
 
 	wg.Wait()
 
-	close(errChan)
+	close(ErrorChannel)
 
-	for err := range errChan {
+	for err := range ErrorChannel {
 		if err != nil && err.Error() != "" {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -254,21 +254,21 @@ func (c *clients) ReceiveFileAndSend(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (c *clients) sendBlock(block BlockStruct, wg *sync.WaitGroup, errChan chan error, header *multipart.FileHeader) {
+func (c *clients) DistributeBlock(block FileBlock, wg *sync.WaitGroup, errChan chan error, header *multipart.FileHeader) {
 	defer wg.Done()
 
 	c.mutex.Lock()
-	selectedNode := c.nodes[0]
-	c.nodes[0].usage = selectedNode.usage + len(block.bytes)
-	sort.Slice(c.nodes, func(i, j int) bool {
-		return c.nodes[i].usage < c.nodes[j].usage
+	selectedNode := c.NodeStats[0]
+	c.NodeStats[0].usage = selectedNode.usage + len(block.bytes)
+	sort.Slice(c.NodeStats, func(i, j int) bool {
+		return c.NodeStats[i].usage < c.NodeStats[j].usage
 	})
 	c.mutex.Unlock()
 
-	bs := c.hashFileName(header.Filename + "-block-" + strconv.Itoa(block.position))
+	bs := c.GenerateFileHash(header.Filename + "-block-" + strconv.Itoa(block.position))
 
 	if selectedNode.usage > 2*maxNodeSize {
-		errChan <- errors.New("All the nodes are currently full. Please try again later.")
+		errChan <- errors.New("All the NodeStats are currently full. Please try again later.")
 		return
 	}
 	var buf bytes.Buffer
@@ -312,7 +312,7 @@ func (c *clients) sendBlock(block BlockStruct, wg *sync.WaitGroup, errChan chan 
 
 }
 
-func (c *clients) calculateNodesUsage() ([]nodeWithUsage, error) {
+func (c *clients) FetchNodeUsageStats() ([]NodeUsage, error) {
 	addresses := []string{
 		"http://localhost:8080",
 		"http://localhost:8081",
@@ -322,7 +322,7 @@ func (c *clients) calculateNodesUsage() ([]nodeWithUsage, error) {
 		"http://localhost:8085",
 	}
 
-	var nodes []nodeWithUsage
+	var nodes []NodeUsage
 
 	for _, addr := range addresses {
 		resp, err := c.httpClient.Get(fmt.Sprintf("%s/%s", addr, "/getCurrentNodeSpace"))
@@ -332,18 +332,18 @@ func (c *clients) calculateNodesUsage() ([]nodeWithUsage, error) {
 			continue
 		}
 
-		var nodeResp nodeResponse
+		var nodeResp NodeUsageResponse
 
 		json.NewDecoder(resp.Body).Decode(&nodeResp)
 
-		nodes = append(nodes, nodeWithUsage{
+		nodes = append(nodes, NodeUsage{
 			address: addr,
 			usage:   nodeResp.Size,
 		})
 	}
 
 	if len(nodes) == 0 {
-		return nil, errors.New("All the nodes are currently unavailable. Please try again later.")
+		return nil, errors.New("All the NodeStats are currently unavailable. Please try again later.")
 	}
 
 	sort.Slice(nodes, func(i, j int) bool {
@@ -352,8 +352,8 @@ func (c *clients) calculateNodesUsage() ([]nodeWithUsage, error) {
 
 	return nodes, nil
 }
-func (c *clients) nodesWithUsage(w http.ResponseWriter, r *http.Request) {
-	nodes, err := c.calculateNodesUsage()
+func (c *clients) GetNodeUsage(w http.ResponseWriter, r *http.Request) {
+	nodes, err := c.FetchNodeUsageStats()
 
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -369,27 +369,27 @@ func (c *clients) nodesWithUsage(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (c *clients) divideFileInBlocks(file []byte) *list.List {
+func (c *clients) SplitFileIntoBlocks(file []byte) *list.List {
 
 	maxBlockSize := 128 * MB
 	numOfBlocks := len(file) / maxBlockSize
 	listOfBlocks := list.New()
 
 	if numOfBlocks == 0 {
-		listOfBlocks.PushBack(BlockStruct{bytes: file, position: 1})
+		listOfBlocks.PushBack(FileBlock{bytes: file, position: 1})
 		return listOfBlocks
 	} else {
 		for i := range numOfBlocks {
 			tmpBlock := file[maxBlockSize*i : (maxBlockSize*i)+maxBlockSize]
-			listOfBlocks.PushBack(BlockStruct{bytes: tmpBlock, position: i + 1})
+			listOfBlocks.PushBack(FileBlock{bytes: tmpBlock, position: i + 1})
 		}
-		listOfBlocks.PushBack(BlockStruct{bytes: file[(maxBlockSize * numOfBlocks):], position: numOfBlocks + 1})
+		listOfBlocks.PushBack(FileBlock{bytes: file[(maxBlockSize * numOfBlocks):], position: numOfBlocks + 1})
 	}
 
 	return listOfBlocks
 }
 
-func (c *clients) hashFileName(fileName string) []byte {
+func (c *clients) GenerateFileHash(fileName string) []byte {
 	h := sha256.New()
 
 	h.Write([]byte(fileName))
