@@ -104,7 +104,7 @@ func (c *clients) AddNewNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := http.Get(u.String() + "/health")
+	res, err := c.httpClient.Get(u.String() + "/health")
 
 	if err != nil || res.StatusCode != 200 {
 		w.WriteHeader(http.StatusInternalServerError)
