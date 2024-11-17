@@ -30,7 +30,7 @@ func main() {
 	}
 }
 
-func currentHealth(w http.ResponseWriter, r *http.Request) {
+func currentHealth(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	return
 }
@@ -107,7 +107,7 @@ func checkIfFileExists(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode("File: " + fileName + " found on the node.")
 }
 
-func getCurrentNodeSpace(w http.ResponseWriter, r *http.Request) {
+func getCurrentNodeSpace(w http.ResponseWriter, _ *http.Request) {
 	var size int64
 	err := filepath.Walk("/Users/navidnazem/desktop/fdsfiletests"+os.Args[2], func(_ string, info os.FileInfo, err error) error {
 		if err != nil {

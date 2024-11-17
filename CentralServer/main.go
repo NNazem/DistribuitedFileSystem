@@ -9,10 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"github.com/gorilla/mux"
-	pgzip "github.com/klauspost/pgzip"
+	"github.com/klauspost/pgzip"
 	"github.com/redis/go-redis/v9"
 	"io"
-	"io/ioutil"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -28,8 +27,6 @@ const serverPort = 8000
 const maxNodeSize = 128 * MB
 
 const MB = 1024 * 1024
-
-const KB = 1024
 
 type FileBlock struct {
 	bytes    []byte
@@ -93,14 +90,20 @@ func (c *clients) RegisterNode(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode("Please send a valid request")
+		err := json.NewEncoder(w).Encode("Please send a valid request")
+		if err != nil {
+			return
+		}
 	}
 
 	u, err := url.ParseRequestURI(node.Url)
 
 	if err != nil || u == nil {
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode("Please send a valid URL")
+		err := json.NewEncoder(w).Encode("Please send a valid URL")
+		if err != nil {
+			return
+		}
 		return
 	}
 
@@ -108,7 +111,10 @@ func (c *clients) RegisterNode(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil || res.StatusCode != 200 {
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode("The new node  cannot be verified. Please try again later.")
+		err := json.NewEncoder(w).Encode("The new node  cannot be verified. Please try again later.")
+		if err != nil {
+			return
+		}
 		return
 	}
 
@@ -125,9 +131,14 @@ func (c *clients) RegisterNode(w http.ResponseWriter, r *http.Request) {
 func (c *clients) DownloadFile(w http.ResponseWriter, r *http.Request) {
 	fileName := r.URL.Query().Get("fileName")
 
-	recompesedBytes := c.ReassembleFile(fileName)
+	recomposedBytes, err := c.ReassembleFile(fileName)
 
-	_, err := w.Write(recompesedBytes)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	_, err = w.Write(recomposedBytes)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -135,7 +146,7 @@ func (c *clients) DownloadFile(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (c *clients) ReassembleFile(filename string) []byte {
+func (c *clients) ReassembleFile(filename string) ([]byte, error) {
 	bs := c.GenerateFileHash(filename)
 	var fileBytes []byte
 
@@ -150,7 +161,13 @@ func (c *clients) ReassembleFile(filename string) []byte {
 		res, _ := c.httpClient.Get(fmt.Sprintf("%s/%s?filename=%s", node, "/retrieveFile", fileBlockName+".bin"))
 
 		body := res.Body
-		defer body.Close()
+		var err error
+		defer func(body io.ReadCloser, err error) {
+			errInsideClosure := body.Close()
+			if errInsideClosure != nil {
+				err = errInsideClosure
+			}
+		}(body, err)
 
 		bodyByte, _ := io.ReadAll(body)
 
@@ -160,11 +177,21 @@ func (c *clients) ReassembleFile(filename string) []byte {
 	reader := bytes.NewReader(fileBytes)
 
 	gz, _ := pgzip.NewReader(reader)
-	defer gz.Close()
+	var err error
+	defer func(gz *pgzip.Reader) {
+		errDefer := gz.Close()
+		if err != nil {
+			err = errDefer
+		}
+	}(gz)
+
+	if err != nil {
+		return nil, err
+	}
 
 	decompressedBytes, _ := io.ReadAll(gz)
 
-	return decompressedBytes
+	return decompressedBytes, nil
 }
 
 func (c *clients) UploadAndDistributeFile(w http.ResponseWriter, r *http.Request) {
@@ -172,11 +199,14 @@ func (c *clients) UploadAndDistributeFile(w http.ResponseWriter, r *http.Request
 
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode("Please, insert a file.")
+		err := json.NewEncoder(w).Encode("Please, insert a file.")
+		if err != nil {
+			return
+		}
 		return
 	}
 
-	body, err := ioutil.ReadAll(file)
+	body, err := io.ReadAll(file)
 
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -190,7 +220,10 @@ func (c *clients) UploadAndDistributeFile(w http.ResponseWriter, r *http.Request
 	err = gz.SetConcurrency(100000, 10)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(err.Error())
+		err := json.NewEncoder(w).Encode(err.Error())
+		if err != nil {
+			return
+		}
 		return
 	}
 
@@ -214,7 +247,10 @@ func (c *clients) UploadAndDistributeFile(w http.ResponseWriter, r *http.Request
 
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode("Error converting the filename to hash.")
+		err := json.NewEncoder(w).Encode("Error converting the filename to hash.")
+		if err != nil {
+			return
+		}
 	}
 
 	wg := sync.WaitGroup{}
@@ -224,7 +260,10 @@ func (c *clients) UploadAndDistributeFile(w http.ResponseWriter, r *http.Request
 
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode("Error retrieving space from NodeStats.")
+		err := json.NewEncoder(w).Encode("Error retrieving space from NodeStats.")
+		if err != nil {
+			return
+		}
 	}
 
 	c.NodeStats = nodesRes
@@ -268,7 +307,7 @@ func (c *clients) DistributeBlock(block FileBlock, wg *sync.WaitGroup, errChan c
 	bs := c.GenerateFileHash(header.Filename + "-block-" + strconv.Itoa(block.position))
 
 	if selectedNode.usage > 2*maxNodeSize {
-		errChan <- errors.New("All the NodeStats are currently full. Please try again later.")
+		errChan <- errors.New("all the NodeStats are currently full. Please try again later")
 		return
 	}
 	var buf bytes.Buffer
@@ -278,35 +317,35 @@ func (c *clients) DistributeBlock(block FileBlock, wg *sync.WaitGroup, errChan c
 	part, err := writer.CreateFormFile("file", fileName)
 
 	if err != nil {
-		errChan <- errors.New("The server couldn't create the form file. Please try again later.")
+		errChan <- errors.New("the server couldn't create the form file. Please try again later")
 		return
 	}
 
 	_, err = part.Write(block.bytes)
 
 	if err != nil {
-		errChan <- errors.New("The server couldn't write the file data to the response. Please try again later.")
+		errChan <- errors.New("the server couldn't write the file data to the response. Please try again later")
 		return
 	}
 
 	err = writer.Close()
 
 	if err != nil {
-		errChan <- errors.New("The server couldn't close the writer. Please try again later")
+		errChan <- errors.New("the server couldn't close the writer. Please try again later")
 		return
 	}
 
 	err = c.redisClient.Set(context.Background(), fmt.Sprintf("%x", bs), selectedNode.address, 0).Err()
 
 	if err != nil {
-		errChan <- errors.New("The server couldn't communicate con redis. Please try again later.")
+		errChan <- errors.New("the server couldn't communicate con redis. Please try again later")
 		return
 	}
 
 	_, err = c.httpClient.Post(fmt.Sprintf(selectedNode.address+"/receiveFile"), writer.FormDataContentType(), &buf)
 
 	if err != nil {
-		errChan <- errors.New("The server couldn't communicate with the node. Please try again later")
+		errChan <- errors.New("the server couldn't communicate with the node. Please try again later")
 		return
 	}
 
@@ -326,15 +365,28 @@ func (c *clients) FetchNodeUsageStats() ([]NodeUsage, error) {
 
 	for _, addr := range addresses {
 		resp, err := c.httpClient.Get(fmt.Sprintf("%s/%s", addr, "/getCurrentNodeSpace"))
-		defer resp.Body.Close()
 
 		if err != nil {
 			continue
 		}
 
+		defer func(Body io.ReadCloser) {
+			errDefer := Body.Close()
+			if errDefer != nil {
+				err = errDefer
+			}
+		}(resp.Body)
+
+		if err != nil {
+			return nil, err
+		}
+
 		var nodeResp NodeUsageResponse
 
-		json.NewDecoder(resp.Body).Decode(&nodeResp)
+		err = json.NewDecoder(resp.Body).Decode(&nodeResp)
+		if err != nil {
+			return nil, err
+		}
 
 		nodes = append(nodes, NodeUsage{
 			address: addr,
@@ -343,7 +395,7 @@ func (c *clients) FetchNodeUsageStats() ([]NodeUsage, error) {
 	}
 
 	if len(nodes) == 0 {
-		return nil, errors.New("All the NodeStats are currently unavailable. Please try again later.")
+		return nil, errors.New("all the NodeStats are currently unavailable. Please try again later")
 	}
 
 	sort.Slice(nodes, func(i, j int) bool {
@@ -352,20 +404,26 @@ func (c *clients) FetchNodeUsageStats() ([]NodeUsage, error) {
 
 	return nodes, nil
 }
-func (c *clients) GetNodeUsage(w http.ResponseWriter, r *http.Request) {
+func (c *clients) GetNodeUsage(w http.ResponseWriter, _ *http.Request) {
 	nodes, err := c.FetchNodeUsageStats()
 
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(err.Error())
+		err := json.NewEncoder(w).Encode(err.Error())
+		if err != nil {
+			return
+		}
 		return
 	}
 
 	w.WriteHeader(http.StatusOK)
 	for _, tmp := range nodes {
-		json.NewEncoder(w).Encode(map[string]float64{
+		err := json.NewEncoder(w).Encode(map[string]float64{
 			tmp.address: float64(tmp.usage),
 		})
+		if err != nil {
+			return
+		}
 	}
 }
 
