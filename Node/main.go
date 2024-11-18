@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 )
 
 func main() {
@@ -21,7 +23,22 @@ func main() {
 	routerHttp.HandleFunc("/checkIfFileExists", checkIfFileExists).Methods("GET")
 	routerHttp.HandleFunc("/getCurrentNodeSpace", getCurrentNodeSpace).Methods("GET")
 
-	log.Println("Node started on port: " + os.Args[1])
+	go func() {
+		url := "http://localhost:" + os.Args[1]
+		var jsonStr = fmt.Sprintf(`{"Url":"%s"}`, url)
+
+		httpClient := http.Client{Timeout: time.Duration(5) * time.Second}
+		req, err := http.NewRequest("POST", "http://localhost:8000/addNode", strings.NewReader(jsonStr))
+		if err != nil {
+			log.Println("error creating the addNode request")
+		}
+		req.Header.Set("Content-Type", "application/json; charset=UTF-8")
+
+		_, err = httpClient.Do(req)
+		if err != nil {
+			log.Println("error while sending the addNode request: " + err.Error())
+		}
+	}()
 
 	err := http.ListenAndServe(fmt.Sprintf("localhost:%s", os.Args[1]), routerHttp)
 

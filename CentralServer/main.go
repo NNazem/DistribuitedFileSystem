@@ -12,6 +12,7 @@ import (
 	"github.com/klauspost/pgzip"
 	"github.com/redis/go-redis/v9"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -89,33 +90,22 @@ func (c *clients) RegisterNode(w http.ResponseWriter, r *http.Request) {
 	err := json.NewDecoder(r.Body).Decode(&node)
 
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		err := json.NewEncoder(w).Encode("Please send a valid request")
-		if err != nil {
-			return
-		}
+		c.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	u, err := url.ParseRequestURI(node.Url)
 
 	if err != nil || u == nil {
-		w.WriteHeader(http.StatusBadRequest)
-		err := json.NewEncoder(w).Encode("Please send a valid URL")
-		if err != nil {
-			return
-		}
+		c.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	res, err := c.httpClient.Get(u.String() + "/health")
+	urlString := u.String() + "/health"
+	res, err := c.httpClient.Get(urlString)
 
 	if err != nil || res.StatusCode != 200 {
-		w.WriteHeader(http.StatusInternalServerError)
-		err := json.NewEncoder(w).Encode("The new node  cannot be verified. Please try again later.")
-		if err != nil {
-			return
-		}
-		return
+		c.respondWithError(w, http.StatusInternalServerError, err.Error())
 	}
 
 	c.mutex.Lock()
@@ -126,6 +116,8 @@ func (c *clients) RegisterNode(w http.ResponseWriter, r *http.Request) {
 	}
 	c.mutex.Unlock()
 	w.WriteHeader(http.StatusOK)
+
+	log.Println("Node added")
 }
 
 func (c *clients) DownloadFile(w http.ResponseWriter, r *http.Request) {
@@ -134,13 +126,13 @@ func (c *clients) DownloadFile(w http.ResponseWriter, r *http.Request) {
 	recomposedBytes, err := c.ReassembleFile(fileName)
 
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		c.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	_, err = w.Write(recomposedBytes)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		c.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -198,18 +190,14 @@ func (c *clients) UploadAndDistributeFile(w http.ResponseWriter, r *http.Request
 	file, header, err := r.FormFile("file")
 
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		err := json.NewEncoder(w).Encode("Please, insert a file.")
-		if err != nil {
-			return
-		}
+		c.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	body, err := io.ReadAll(file)
 
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		c.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -219,21 +207,17 @@ func (c *clients) UploadAndDistributeFile(w http.ResponseWriter, r *http.Request
 
 	err = gz.SetConcurrency(100000, 10)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		err := json.NewEncoder(w).Encode(err.Error())
-		if err != nil {
-			return
-		}
+		c.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	if _, err := gz.Write(body); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		c.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	if err := gz.Close(); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		c.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -246,11 +230,8 @@ func (c *clients) UploadAndDistributeFile(w http.ResponseWriter, r *http.Request
 	err = c.redisClient.Set(context.Background(), fmt.Sprintf("%x", hashedFileName), listOfBlocks.Len(), 0).Err()
 
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		err := json.NewEncoder(w).Encode("Error converting the filename to hash.")
-		if err != nil {
-			return
-		}
+		c.respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 
 	wg := sync.WaitGroup{}
@@ -259,11 +240,8 @@ func (c *clients) UploadAndDistributeFile(w http.ResponseWriter, r *http.Request
 	nodesRes, err := c.FetchNodeUsageStats()
 
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		err := json.NewEncoder(w).Encode("Error retrieving space from NodeStats.")
-		if err != nil {
-			return
-		}
+		c.respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 
 	c.NodeStats = nodesRes
@@ -285,7 +263,7 @@ func (c *clients) UploadAndDistributeFile(w http.ResponseWriter, r *http.Request
 
 	for err := range ErrorChannel {
 		if err != nil && err.Error() != "" {
-			w.WriteHeader(http.StatusInternalServerError)
+			c.respondWithError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 	}
@@ -352,18 +330,9 @@ func (c *clients) DistributeBlock(block FileBlock, wg *sync.WaitGroup, errChan c
 }
 
 func (c *clients) FetchNodeUsageStats() ([]NodeUsage, error) {
-	addresses := []string{
-		"http://localhost:8080",
-		"http://localhost:8081",
-		"http://localhost:8082",
-		"http://localhost:8083",
-		"http://localhost:8084",
-		"http://localhost:8085",
-	}
-
 	var nodes []NodeUsage
 
-	for _, addr := range addresses {
+	for _, addr := range c.NodeAddresses {
 		resp, err := c.httpClient.Get(fmt.Sprintf("%s/%s", addr, "/getCurrentNodeSpace"))
 
 		if err != nil {
@@ -408,11 +377,7 @@ func (c *clients) GetNodeUsage(w http.ResponseWriter, _ *http.Request) {
 	nodes, err := c.FetchNodeUsageStats()
 
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		err := json.NewEncoder(w).Encode(err.Error())
-		if err != nil {
-			return
-		}
+		c.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -422,6 +387,7 @@ func (c *clients) GetNodeUsage(w http.ResponseWriter, _ *http.Request) {
 			tmp.address: float64(tmp.usage),
 		})
 		if err != nil {
+			c.respondWithError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 	}
@@ -454,4 +420,9 @@ func (c *clients) GenerateFileHash(fileName string) []byte {
 
 	bs := h.Sum(nil)
 	return bs
+}
+
+func (c *clients) respondWithError(w http.ResponseWriter, code int, message string) {
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
