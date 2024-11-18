@@ -11,6 +11,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/klauspost/pgzip"
 	"github.com/redis/go-redis/v9"
+	"hash"
 	"io"
 	"log"
 	"mime/multipart"
@@ -147,13 +148,23 @@ func (c *clients) ReassembleFile(filename string) ([]byte, error) {
 	for i := range numOfBlocks {
 		fileBlockName := filename + "-block-" + strconv.Itoa(i+1)
 		bs := c.GenerateFileHash(fileBlockName)
+		formattedBs := fmt.Sprintf("%x", bs)
 
-		node := c.redisClient.Get(context.Background(), fmt.Sprintf("%x", bs)).Val()
+		fields := []string{"node_address", "block_hash"}
+		values, err := c.redisClient.HMGet(context.Background(), formattedBs, fields...).Result()
 
-		res, _ := c.httpClient.Get(fmt.Sprintf("%s/%s?filename=%s", node, "/retrieveFile", fileBlockName+".bin"))
+		if err != nil {
+			return nil, err
+		}
+
+		nodeAddress := values[0]
+		blockDataOriginalHash := values[1]
+
+		log.Println(values)
+
+		res, _ := c.httpClient.Get(fmt.Sprintf("%s/%s?filename=%s", nodeAddress, "/retrieveFile", fileBlockName+".bin"))
 
 		body := res.Body
-		var err error
 		defer func(body io.ReadCloser, err error) {
 			errInsideClosure := body.Close()
 			if errInsideClosure != nil {
@@ -162,6 +173,13 @@ func (c *clients) ReassembleFile(filename string) ([]byte, error) {
 		}(body, err)
 
 		bodyByte, _ := io.ReadAll(body)
+
+		bs2 := c.GenerateBlockHash(bodyByte)
+		blockDataHash := fmt.Sprintf("%x", bs2)
+
+		if blockDataHash != blockDataOriginalHash {
+			return nil, errors.New("the hash of the block doesn't match")
+		}
 
 		fileBytes = append(fileBytes, bodyByte...)
 	}
@@ -313,19 +331,46 @@ func (c *clients) DistributeBlock(block FileBlock, wg *sync.WaitGroup, errChan c
 		return
 	}
 
-	err = c.redisClient.Set(context.Background(), fmt.Sprintf("%x", bs), selectedNode.address, 0).Err()
+	data, err := io.ReadAll(&buf)
 
 	if err != nil {
-		errChan <- errors.New("the server couldn't communicate con redis. Please try again later")
+		errChan <- err
+	}
+
+	blockDataHash := c.GenerateBlockHash(block.bytes)
+
+	formattedBs := fmt.Sprintf("%x", bs)
+
+	err = c.redisClient.HSet(context.Background(), formattedBs,
+		"node_address", selectedNode.address,
+		"block_hash", fmt.Sprintf("%x", blockDataHash),
+	).Err()
+
+	if err != nil {
+		errChan <- err
 		return
 	}
 
-	_, err = c.httpClient.Post(fmt.Sprintf(selectedNode.address+"/receiveFile"), writer.FormDataContentType(), &buf)
+	for i := 0; i < len(c.NodeStats); i++ {
+		bufReader := bytes.NewReader(data)
+		res, err := c.httpClient.Post(fmt.Sprintf(selectedNode.address+"/receiveFile"), writer.FormDataContentType(), bufReader)
 
-	if err != nil {
-		errChan <- errors.New("the server couldn't communicate with the node. Please try again later")
-		return
+		if res != nil {
+			defer res.Body.Close()
+		}
+
+		if err == nil && res.StatusCode == 200 {
+			return
+		}
+
+		if err != nil {
+			errChan <- err
+			return
+		}
 	}
+
+	errChan <- errors.New("the server couldn't communicate with the nodes. Please try again later")
+	return
 
 }
 
@@ -416,7 +461,17 @@ func (c *clients) SplitFileIntoBlocks(file []byte) *list.List {
 func (c *clients) GenerateFileHash(fileName string) []byte {
 	h := sha256.New()
 
-	h.Write([]byte(fileName))
+	return c.generateHash([]byte(fileName), h)
+}
+
+func (c *clients) GenerateBlockHash(blockData []byte) []byte {
+	h := sha256.New()
+
+	return c.generateHash(blockData, h)
+}
+
+func (c *clients) generateHash(data []byte, h hash.Hash) []byte {
+	h.Write(data)
 
 	bs := h.Sum(nil)
 	return bs
