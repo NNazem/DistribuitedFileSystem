@@ -2,16 +2,13 @@ package main
 
 import (
 	"bytes"
-	"container/list"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/gorilla/mux"
 	"github.com/klauspost/pgzip"
 	"github.com/redis/go-redis/v9"
-	"hash"
 	"io"
 	"log"
 	"mime/multipart"
@@ -91,14 +88,14 @@ func (c *clients) RegisterNode(w http.ResponseWriter, r *http.Request) {
 	err := json.NewDecoder(r.Body).Decode(&node)
 
 	if err != nil {
-		c.respondWithError(w, http.StatusBadRequest, err.Error())
+		respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	u, err := url.ParseRequestURI(node.Url)
 
 	if err != nil || u == nil {
-		c.respondWithError(w, http.StatusBadRequest, err.Error())
+		respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -106,7 +103,7 @@ func (c *clients) RegisterNode(w http.ResponseWriter, r *http.Request) {
 	res, err := c.httpClient.Get(urlString)
 
 	if err != nil || res.StatusCode != 200 {
-		c.respondWithError(w, http.StatusInternalServerError, err.Error())
+		respondWithError(w, http.StatusInternalServerError, err.Error())
 	}
 
 	c.mutex.Lock()
@@ -127,27 +124,27 @@ func (c *clients) DownloadFile(w http.ResponseWriter, r *http.Request) {
 	recomposedBytes, err := c.ReassembleFile(fileName)
 
 	if err != nil {
-		c.respondWithError(w, http.StatusInternalServerError, err.Error())
+		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	_, err = w.Write(recomposedBytes)
 	if err != nil {
-		c.respondWithError(w, http.StatusInternalServerError, err.Error())
+		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusOK)
 }
 
 func (c *clients) ReassembleFile(filename string) ([]byte, error) {
-	bs := c.GenerateFileHash(filename)
+	bs := GenerateFileHash(filename)
 	var fileBytes []byte
 
 	numOfBlocks, _ := strconv.Atoi(c.redisClient.Get(context.Background(), fmt.Sprintf("%x", bs)).Val())
 
 	for i := range numOfBlocks {
 		fileBlockName := filename + "-block-" + strconv.Itoa(i+1)
-		bs := c.GenerateFileHash(fileBlockName)
+		bs := GenerateFileHash(fileBlockName)
 		formattedBs := fmt.Sprintf("%x", bs)
 
 		fields := []string{"node_address", "block_hash"}
@@ -174,7 +171,7 @@ func (c *clients) ReassembleFile(filename string) ([]byte, error) {
 
 		bodyByte, _ := io.ReadAll(body)
 
-		bs2 := c.GenerateBlockHash(bodyByte)
+		bs2 := GenerateBlockHash(bodyByte)
 		blockDataHash := fmt.Sprintf("%x", bs2)
 
 		if blockDataHash != blockDataOriginalHash {
@@ -208,14 +205,14 @@ func (c *clients) UploadAndDistributeFile(w http.ResponseWriter, r *http.Request
 	file, header, err := r.FormFile("file")
 
 	if err != nil {
-		c.respondWithError(w, http.StatusInternalServerError, err.Error())
+		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	body, err := io.ReadAll(file)
 
 	if err != nil {
-		c.respondWithError(w, http.StatusInternalServerError, err.Error())
+		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -225,30 +222,30 @@ func (c *clients) UploadAndDistributeFile(w http.ResponseWriter, r *http.Request
 
 	err = gz.SetConcurrency(100000, 10)
 	if err != nil {
-		c.respondWithError(w, http.StatusInternalServerError, err.Error())
+		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	if _, err := gz.Write(body); err != nil {
-		c.respondWithError(w, http.StatusInternalServerError, err.Error())
+		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	if err := gz.Close(); err != nil {
-		c.respondWithError(w, http.StatusInternalServerError, err.Error())
+		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	compressedData := CompressedBuffer.Bytes()
 
-	listOfBlocks := c.SplitFileIntoBlocks(compressedData)
+	listOfBlocks := SplitFileIntoBlocks(compressedData)
 
-	hashedFileName := c.GenerateFileHash(header.Filename)
+	hashedFileName := GenerateFileHash(header.Filename)
 
 	err = c.redisClient.Set(context.Background(), fmt.Sprintf("%x", hashedFileName), listOfBlocks.Len(), 0).Err()
 
 	if err != nil {
-		c.respondWithError(w, http.StatusInternalServerError, err.Error())
+		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -258,7 +255,7 @@ func (c *clients) UploadAndDistributeFile(w http.ResponseWriter, r *http.Request
 	nodesRes, err := c.FetchNodeUsageStats()
 
 	if err != nil {
-		c.respondWithError(w, http.StatusInternalServerError, err.Error())
+		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -281,7 +278,7 @@ func (c *clients) UploadAndDistributeFile(w http.ResponseWriter, r *http.Request
 
 	for err := range ErrorChannel {
 		if err != nil && err.Error() != "" {
-			c.respondWithError(w, http.StatusInternalServerError, err.Error())
+			respondWithError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 	}
@@ -300,7 +297,7 @@ func (c *clients) DistributeBlock(block FileBlock, wg *sync.WaitGroup, errChan c
 	})
 	c.mutex.Unlock()
 
-	bs := c.GenerateFileHash(header.Filename + "-block-" + strconv.Itoa(block.position))
+	bs := GenerateFileHash(header.Filename + "-block-" + strconv.Itoa(block.position))
 
 	if selectedNode.usage > 2*maxNodeSize {
 		errChan <- errors.New("all the NodeStats are currently full. Please try again later")
@@ -337,7 +334,7 @@ func (c *clients) DistributeBlock(block FileBlock, wg *sync.WaitGroup, errChan c
 		errChan <- err
 	}
 
-	blockDataHash := c.GenerateBlockHash(block.bytes)
+	blockDataHash := GenerateBlockHash(block.bytes)
 
 	formattedBs := fmt.Sprintf("%x", bs)
 
@@ -422,7 +419,7 @@ func (c *clients) GetNodeUsage(w http.ResponseWriter, _ *http.Request) {
 	nodes, err := c.FetchNodeUsageStats()
 
 	if err != nil {
-		c.respondWithError(w, http.StatusInternalServerError, err.Error())
+		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -432,52 +429,8 @@ func (c *clients) GetNodeUsage(w http.ResponseWriter, _ *http.Request) {
 			tmp.address: float64(tmp.usage),
 		})
 		if err != nil {
-			c.respondWithError(w, http.StatusInternalServerError, err.Error())
+			respondWithError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 	}
-}
-
-func (c *clients) SplitFileIntoBlocks(file []byte) *list.List {
-
-	maxBlockSize := 128 * MB
-	numOfBlocks := len(file) / maxBlockSize
-	listOfBlocks := list.New()
-
-	if numOfBlocks == 0 {
-		listOfBlocks.PushBack(FileBlock{bytes: file, position: 1})
-		return listOfBlocks
-	} else {
-		for i := range numOfBlocks {
-			tmpBlock := file[maxBlockSize*i : (maxBlockSize*i)+maxBlockSize]
-			listOfBlocks.PushBack(FileBlock{bytes: tmpBlock, position: i + 1})
-		}
-		listOfBlocks.PushBack(FileBlock{bytes: file[(maxBlockSize * numOfBlocks):], position: numOfBlocks + 1})
-	}
-
-	return listOfBlocks
-}
-
-func (c *clients) GenerateFileHash(fileName string) []byte {
-	h := sha256.New()
-
-	return c.generateHash([]byte(fileName), h)
-}
-
-func (c *clients) GenerateBlockHash(blockData []byte) []byte {
-	h := sha256.New()
-
-	return c.generateHash(blockData, h)
-}
-
-func (c *clients) generateHash(data []byte, h hash.Hash) []byte {
-	h.Write(data)
-
-	bs := h.Sum(nil)
-	return bs
-}
-
-func (c *clients) respondWithError(w http.ResponseWriter, code int, message string) {
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
