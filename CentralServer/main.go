@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/gorilla/mux"
@@ -15,7 +14,6 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
-	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -42,25 +40,15 @@ type FileBlock struct {
 	position int
 }
 
-type NodeUsage struct {
-	address string
-	usage   int
-}
-
-type NodeUsageResponse struct {
-	Size int `json:"Size"`
-}
-
 type NodeRegistrationRequest struct {
 	Url string `json:"Url"`
 }
 
 type clients struct {
-	httpClient    http.Client
-	redisClient   *redis.Client
-	NodeAddresses []string
-	NodeStats     []NodeUsage
-	mutex         sync.Mutex
+	httpClient  http.Client
+	redisClient *redis.Client
+	mutex       *sync.Mutex
+	nodeManager *nodeManager
 }
 
 func newHttpClient() http.Client {
@@ -77,7 +65,12 @@ func newRedisClient() *redis.Client {
 }
 
 func main() {
-	clients := &clients{httpClient: newHttpClient(), redisClient: newRedisClient()}
+	httpClient := newHttpClient()
+	redisClient := newRedisClient()
+	mutex := &sync.Mutex{}
+
+	nodeManagerClient := &nodeManager{httpClient: httpClient, mutex: mutex}
+	clients := &clients{httpClient: httpClient, redisClient: redisClient, mutex: mutex, nodeManager: nodeManagerClient}
 
 	routerHttp := mux.NewRouter()
 
@@ -88,51 +81,15 @@ func main() {
 	})
 	routerHttp.Handle("/metrics", promhttp.Handler())
 	routerHttp.HandleFunc("/sendFile", clients.UploadAndDistributeFile).Methods("POST")
-	routerHttp.HandleFunc("/nodesUsage", clients.GetNodeUsage).Methods("GET")
+	//routerHttp.HandleFunc("/nodesUsage", clients.GetNodeUsage).Methods("GET")
 	routerHttp.HandleFunc("/retrieveFile", clients.DownloadFile).Methods("GET")
-	routerHttp.HandleFunc("/addNode", clients.RegisterNode).Methods("POST")
+	routerHttp.HandleFunc("/addNode", clients.nodeManager.VerifyAndRegisterNode).Methods("POST")
 
 	err := http.ListenAndServe(fmt.Sprintf(":%d", serverPort), routerHttp)
 
 	if err != nil {
 		os.Exit(-1)
 	}
-}
-
-func (c *clients) RegisterNode(w http.ResponseWriter, r *http.Request) {
-	httpRequestsTotal.WithLabelValues(r.Method, r.URL.Path).Inc()
-	var node NodeRegistrationRequest
-	err := json.NewDecoder(r.Body).Decode(&node)
-
-	if err != nil {
-		respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	u, err := url.ParseRequestURI(node.Url)
-
-	if err != nil || u == nil {
-		respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	urlString := u.String() + "/health"
-	res, err := c.httpClient.Get(urlString)
-
-	if err != nil || res.StatusCode != 200 {
-		respondWithError(w, http.StatusInternalServerError, err.Error())
-	}
-
-	c.mutex.Lock()
-	c.NodeAddresses = append(c.NodeAddresses, u.String())
-	nodesWithUsage, err := c.FetchNodeUsageStats()
-	if err == nil {
-		c.NodeStats = nodesWithUsage
-	}
-	c.mutex.Unlock()
-	w.WriteHeader(http.StatusOK)
-
-	log.Println("Node added")
 }
 
 func (c *clients) DownloadFile(w http.ResponseWriter, r *http.Request) {
@@ -271,14 +228,14 @@ func (c *clients) UploadAndDistributeFile(w http.ResponseWriter, r *http.Request
 	wg := sync.WaitGroup{}
 	ErrorChannel := make(chan error, listOfBlocks.Len())
 
-	nodesRes, err := c.FetchNodeUsageStats()
+	nodesRes, err := c.nodeManager.RetrieveNodeStats()
 
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	c.NodeStats = nodesRes
+	c.nodeManager.NodeStats = nodesRes
 
 	for listOfBlocks.Len() > 0 {
 
@@ -309,10 +266,10 @@ func (c *clients) DistributeBlock(block FileBlock, wg *sync.WaitGroup, errChan c
 	defer wg.Done()
 
 	c.mutex.Lock()
-	selectedNode := c.NodeStats[0]
-	c.NodeStats[0].usage = selectedNode.usage + len(block.bytes)
-	sort.Slice(c.NodeStats, func(i, j int) bool {
-		return c.NodeStats[i].usage < c.NodeStats[j].usage
+	selectedNode := c.nodeManager.NodeStats[0]
+	c.nodeManager.NodeStats[0].usage = selectedNode.usage + len(block.bytes)
+	sort.Slice(c.nodeManager.NodeStats, func(i, j int) bool {
+		return c.nodeManager.NodeStats[i].usage < c.nodeManager.NodeStats[j].usage
 	})
 	c.mutex.Unlock()
 
@@ -367,7 +324,7 @@ func (c *clients) DistributeBlock(block FileBlock, wg *sync.WaitGroup, errChan c
 		return
 	}
 
-	for i := 0; i < len(c.NodeStats); i++ {
+	for i := 0; i < len(c.nodeManager.NodeStats); i++ {
 		bufReader := bytes.NewReader(data)
 		res, err := c.httpClient.Post(fmt.Sprintf(selectedNode.address+"/receiveFile"), writer.FormDataContentType(), bufReader)
 
@@ -390,53 +347,9 @@ func (c *clients) DistributeBlock(block FileBlock, wg *sync.WaitGroup, errChan c
 
 }
 
-func (c *clients) FetchNodeUsageStats() ([]NodeUsage, error) {
-	var nodes []NodeUsage
-
-	for _, addr := range c.NodeAddresses {
-		resp, err := c.httpClient.Get(fmt.Sprintf("%s/%s", addr, "/getCurrentNodeSpace"))
-
-		if err != nil {
-			continue
-		}
-
-		defer func(Body io.ReadCloser) {
-			errDefer := Body.Close()
-			if errDefer != nil {
-				err = errDefer
-			}
-		}(resp.Body)
-
-		if err != nil {
-			return nil, err
-		}
-
-		var nodeResp NodeUsageResponse
-
-		err = json.NewDecoder(resp.Body).Decode(&nodeResp)
-		if err != nil {
-			return nil, err
-		}
-
-		nodes = append(nodes, NodeUsage{
-			address: addr,
-			usage:   nodeResp.Size,
-		})
-	}
-
-	if len(nodes) == 0 {
-		return nil, errors.New("all the NodeStats are currently unavailable. Please try again later")
-	}
-
-	sort.Slice(nodes, func(i, j int) bool {
-		return nodes[i].usage < nodes[j].usage
-	})
-
-	return nodes, nil
-}
-func (c *clients) GetNodeUsage(w http.ResponseWriter, r *http.Request) {
+/*func (c *clients) GetNodeUsage(w http.ResponseWriter, r *http.Request) {
 	httpRequestsTotal.WithLabelValues(r.Method, r.URL.Path).Inc()
-	nodes, err := c.FetchNodeUsageStats()
+	nodes, err := c.RetrieveNodeStats()
 
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -453,4 +366,4 @@ func (c *clients) GetNodeUsage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-}
+}*/
