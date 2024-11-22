@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"github.com/gorilla/mux"
 	"github.com/klauspost/pgzip"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"io"
 	"log"
@@ -26,6 +28,14 @@ const serverPort = 8000
 const maxNodeSize = 128 * MB
 
 const MB = 1024 * 1024
+
+var httpRequestsTotal = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "http_requests_total",
+		Help: "Total number of HTTP requests received, labeled by method and path.",
+	},
+	[]string{"method", "path"},
+)
 
 type FileBlock struct {
 	bytes    []byte
@@ -71,6 +81,12 @@ func main() {
 
 	routerHttp := mux.NewRouter()
 
+	prometheus.MustRegister(httpRequestsTotal)
+	routerHttp.HandleFunc("/", func(w http.ResponseWriter, request *http.Request) {
+		httpRequestsTotal.WithLabelValues(request.Method, request.URL.Path).Inc()
+		w.Write([]byte("Hello, Prometheus!"))
+	})
+	routerHttp.Handle("/metrics", promhttp.Handler())
 	routerHttp.HandleFunc("/sendFile", clients.UploadAndDistributeFile).Methods("POST")
 	routerHttp.HandleFunc("/nodesUsage", clients.GetNodeUsage).Methods("GET")
 	routerHttp.HandleFunc("/retrieveFile", clients.DownloadFile).Methods("GET")
@@ -84,6 +100,7 @@ func main() {
 }
 
 func (c *clients) RegisterNode(w http.ResponseWriter, r *http.Request) {
+	httpRequestsTotal.WithLabelValues(r.Method, r.URL.Path).Inc()
 	var node NodeRegistrationRequest
 	err := json.NewDecoder(r.Body).Decode(&node)
 
@@ -119,6 +136,7 @@ func (c *clients) RegisterNode(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *clients) DownloadFile(w http.ResponseWriter, r *http.Request) {
+	httpRequestsTotal.WithLabelValues(r.Method, r.URL.Path).Inc()
 	fileName := r.URL.Query().Get("fileName")
 
 	recomposedBytes, err := c.ReassembleFile(fileName)
@@ -202,6 +220,7 @@ func (c *clients) ReassembleFile(filename string) ([]byte, error) {
 }
 
 func (c *clients) UploadAndDistributeFile(w http.ResponseWriter, r *http.Request) {
+	httpRequestsTotal.WithLabelValues(r.Method, r.URL.Path).Inc()
 	file, header, err := r.FormFile("file")
 
 	if err != nil {
@@ -415,7 +434,8 @@ func (c *clients) FetchNodeUsageStats() ([]NodeUsage, error) {
 
 	return nodes, nil
 }
-func (c *clients) GetNodeUsage(w http.ResponseWriter, _ *http.Request) {
+func (c *clients) GetNodeUsage(w http.ResponseWriter, r *http.Request) {
+	httpRequestsTotal.WithLabelValues(r.Method, r.URL.Path).Inc()
 	nodes, err := c.FetchNodeUsageStats()
 
 	if err != nil {

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"io"
 	"log"
 	"net/http"
@@ -14,9 +16,25 @@ import (
 	"time"
 )
 
+const MB = 1024 * 1024
+
+var availableSpace = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "node_available_space",
+		Help: "Available space for each node",
+	},
+	[]string{"node"}, // Rimuovi "occupied_space" come etichetta
+)
+
 func main() {
 	routerHttp := mux.NewRouter()
 
+	prometheus.MustRegister(availableSpace)
+	routerHttp.HandleFunc("/", func(w http.ResponseWriter, request *http.Request) {
+		availableSpace.WithLabelValues(request.Method, request.URL.Path).Inc()
+		w.Write([]byte("Hello, Prometheus!"))
+	})
+	routerHttp.Handle("/metrics", promhttp.Handler())
 	routerHttp.HandleFunc("/health", currentHealth).Methods("GET")
 	routerHttp.HandleFunc("/receiveFile", receiveFile).Methods("POST")
 	routerHttp.HandleFunc("/retrieveFile", retrieveFile).Methods("GET")
@@ -76,6 +94,12 @@ func receiveFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
+
+	size, _ := calculateOccupiedSize()
+
+	occupiedSpace := float64(size / (128 + MB))
+
+	availableSpace.With(prometheus.Labels{"node": fmt.Sprintf("localhost:%s", os.Args[1])}).Set(occupiedSpace)
 }
 
 func retrieveFile(w http.ResponseWriter, r *http.Request) {
@@ -125,16 +149,7 @@ func checkIfFileExists(w http.ResponseWriter, r *http.Request) {
 }
 
 func getCurrentNodeSpace(w http.ResponseWriter, _ *http.Request) {
-	var size int64
-	err := filepath.Walk("/Users/navidnazem/desktop/fdsfiletests"+os.Args[2], func(_ string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() {
-			size += info.Size()
-		}
-		return err
-	})
+	size, err := calculateOccupiedSize()
 
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -145,4 +160,18 @@ func getCurrentNodeSpace(w http.ResponseWriter, _ *http.Request) {
 	json.NewEncoder(w).Encode(map[string]int64{
 		"Size": size,
 	})
+}
+
+func calculateOccupiedSize() (int64, error) {
+	var size int64
+	err := filepath.Walk("/Users/navidnazem/desktop/fdsfiletests"+os.Args[2], func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			size += info.Size()
+		}
+		return err
+	})
+	return size, err
 }

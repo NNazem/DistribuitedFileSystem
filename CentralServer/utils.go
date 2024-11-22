@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"hash"
+	"log"
 	"net/http"
 )
 
@@ -48,6 +49,7 @@ func generateHash(data []byte, h hash.Hash) []byte {
 }
 
 func respondWithError(w http.ResponseWriter, code int, message string) {
+	log.Printf("Error %d: %s", code, message)
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
