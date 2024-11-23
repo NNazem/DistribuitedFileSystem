@@ -81,7 +81,7 @@ func main() {
 	})
 	routerHttp.Handle("/metrics", promhttp.Handler())
 	routerHttp.HandleFunc("/sendFile", clients.UploadAndDistributeFile).Methods("POST")
-	//routerHttp.HandleFunc("/nodesUsage", clients.GetNodeUsage).Methods("GET")
+	routerHttp.HandleFunc("/nodesUsage", clients.nodeManager.GetNodeUsage).Methods("GET")
 	routerHttp.HandleFunc("/retrieveFile", clients.DownloadFile).Methods("GET")
 	routerHttp.HandleFunc("/addNode", clients.nodeManager.VerifyAndRegisterNode).Methods("POST")
 
@@ -346,24 +346,3 @@ func (c *clients) DistributeBlock(block FileBlock, wg *sync.WaitGroup, errChan c
 	return
 
 }
-
-/*func (c *clients) GetNodeUsage(w http.ResponseWriter, r *http.Request) {
-	httpRequestsTotal.WithLabelValues(r.Method, r.URL.Path).Inc()
-	nodes, err := c.RetrieveNodeStats()
-
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	for _, tmp := range nodes {
-		err := json.NewEncoder(w).Encode(map[string]float64{
-			tmp.address: float64(tmp.usage),
-		})
-		if err != nil {
-			respondWithError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-	}
-}*/

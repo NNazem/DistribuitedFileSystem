@@ -108,7 +108,7 @@ func (n *nodeManager) RetrieveNodeStats() ([]NodeUsage, error) {
 	}
 
 	if len(nodes) == 0 {
-		return nil, errors.New("all the NodeStats are currently unavailable. Please try again later")
+		return nil, errors.New("all the Nodes are currently unavailable. Please try again later")
 	}
 
 	sort.Slice(nodes, func(i, j int) bool {
@@ -116,4 +116,25 @@ func (n *nodeManager) RetrieveNodeStats() ([]NodeUsage, error) {
 	})
 
 	return nodes, nil
+}
+
+func (n *nodeManager) GetNodeUsage(w http.ResponseWriter, r *http.Request) {
+	httpRequestsTotal.WithLabelValues(r.Method, r.URL.Path).Inc()
+	nodes, err := n.RetrieveNodeStats()
+
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	for _, tmp := range nodes {
+		err := json.NewEncoder(w).Encode(map[string]float64{
+			tmp.address: float64(tmp.usage),
+		})
+		if err != nil {
+			respondWithError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 }
