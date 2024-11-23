@@ -29,7 +29,7 @@ type NodeUsageResponse struct {
 type nodeManager struct {
 	NodeAddresses []string
 	NodeStats     []NodeUsage
-	httpClient    http.Client
+	httpClient    *http.Client
 	mutex         *sync.Mutex
 }
 
