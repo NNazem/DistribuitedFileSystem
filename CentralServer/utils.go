@@ -53,3 +53,12 @@ func respondWithError(w http.ResponseWriter, code int, message string) {
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
+
+func logAndRespondError(w http.ResponseWriter, code int, message string, err error) {
+	if err != nil {
+		log.Printf("[ERROR] %s: %v", message, err)
+	} else {
+		log.Printf("[ERROR] %s", message)
+	}
+	respondWithError(w, code, message)
+}

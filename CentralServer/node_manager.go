@@ -14,10 +14,10 @@ import (
 
 type NodeManager interface {
 	VerifyAndRegisterNode(w http.ResponseWriter, r *http.Request)
-	RetrieveNodeStats() ([]NodeUsage, error)
+	RetrieveNodeStats() ([]Node, error)
 }
 
-type NodeUsage struct {
+type Node struct {
 	address string
 	usage   int
 }
@@ -28,7 +28,7 @@ type NodeUsageResponse struct {
 
 type nodeManager struct {
 	NodeAddresses []string
-	NodeStats     []NodeUsage
+	NodeStats     []Node
 	httpClient    *http.Client
 	mutex         *sync.Mutex
 }
@@ -73,8 +73,8 @@ func (n *nodeManager) registerNode(node string) {
 	n.mutex.Unlock()
 }
 
-func (n *nodeManager) RetrieveNodeStats() ([]NodeUsage, error) {
-	var nodes []NodeUsage
+func (n *nodeManager) RetrieveNodeStats() ([]Node, error) {
+	var nodes []Node
 
 	for _, addr := range n.NodeAddresses {
 		resp, err := n.httpClient.Get(fmt.Sprintf("%s/%s", addr, "/getCurrentNodeSpace"))
@@ -101,7 +101,7 @@ func (n *nodeManager) RetrieveNodeStats() ([]NodeUsage, error) {
 			return nil, err
 		}
 
-		nodes = append(nodes, NodeUsage{
+		nodes = append(nodes, Node{
 			address: addr,
 			usage:   nodeResp.Size,
 		})
@@ -137,4 +137,33 @@ func (n *nodeManager) GetNodeUsage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+func (n *nodeManager) SelectAndUpdateNode(block FileBlock) Node {
+	n.mutex.Lock()
+	selectedNode := n.NodeStats[0]
+	n.NodeStats[0].usage = selectedNode.usage + len(block.bytes)
+	sort.Slice(n.NodeStats, func(i, j int) bool {
+		return n.NodeStats[i].usage < n.NodeStats[j].usage
+	})
+	n.mutex.Unlock()
+	return selectedNode
+}
+
+func (n *nodeManager) DeleteNode(node Node) {
+	n.mutex.Lock()
+	for i := range n.NodeStats {
+		if n.NodeStats[i].address == node.address {
+			log.Println("Node removed from nodestats")
+			n.NodeStats[i] = n.NodeStats[len(n.NodeStats)-1]
+		}
+	}
+
+	for i := range n.NodeAddresses {
+		if n.NodeAddresses[i] == node.address {
+			log.Println("Node removed from nodestats")
+			n.NodeAddresses[i] = n.NodeAddresses[len(n.NodeAddresses)-1]
+		}
+	}
+	n.mutex.Unlock()
 }

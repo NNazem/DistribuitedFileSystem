@@ -6,6 +6,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
 	"log"
 	"net/http"
 	"sync"
@@ -56,13 +57,17 @@ func newRedisClient() *redis.Client {
 	})
 }
 
+var logger *zap.Logger
+
 func main() {
+	logger, _ = zap.NewProduction()
 	httpClient := newHttpClient()
 	redisClient := newRedisClient()
 	mutex := &sync.Mutex{}
 
 	nodeManagerClient := &nodeManager{httpClient: &httpClient, mutex: mutex}
-	fileManagerClient := &fileManager{nodeManager: nodeManagerClient, redisClient: redisClient, httpClient: &httpClient, mutex: mutex}
+	redisManagerClient := &RedisManager{redisClient: redisClient}
+	fileManagerClient := &fileManager{nodeManager: nodeManagerClient, redisManager: redisManagerClient, httpClient: &httpClient, mutex: mutex}
 	clients := &clients{httpClient: httpClient, redisClient: redisClient, mutex: mutex, nodeManager: nodeManagerClient, fileManager: fileManagerClient}
 
 	routerHttp := clients.SetupRouter()
