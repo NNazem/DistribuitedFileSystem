@@ -1,15 +1,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/redis/go-redis/v9"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"sort"
 	"sync"
+	"time"
 )
 
 type NodeManager interface {
@@ -22,6 +25,13 @@ type Node struct {
 	usage   int
 }
 
+type NodeStatus struct {
+	Address     string `json:"address"`
+	Status      string `json:"status"`
+	Usage       int    `json:"usage"`
+	LastChecked string `json:"last_checked"`
+}
+
 type NodeUsageResponse struct {
 	Size int `json:"Size"`
 }
@@ -31,6 +41,7 @@ type nodeManager struct {
 	NodeStats     []Node
 	httpClient    *http.Client
 	mutex         *sync.Mutex
+	redisClient   *redis.Client
 }
 
 func (n *nodeManager) VerifyAndRegisterNode(w http.ResponseWriter, r *http.Request) {
@@ -69,6 +80,24 @@ func (n *nodeManager) registerNode(node string) {
 	nodesWithUsage, err := n.RetrieveNodeStats()
 	if err == nil {
 		n.NodeStats = nodesWithUsage
+	}
+
+	now := time.Now().UTC()
+	timestamp := now.Format(time.RFC3339)
+
+	nodeStatus := NodeStatus{
+		Address:     node,
+		Status:      "UP",
+		Usage:       0,
+		LastChecked: timestamp,
+	}
+
+	jsonData, err := json.Marshal(nodeStatus)
+
+	err = n.redisClient.LPush(context.Background(), "nodes", jsonData).Err()
+
+	if err != nil {
+		log.Println(err)
 	}
 	n.mutex.Unlock()
 }

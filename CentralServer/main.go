@@ -65,14 +65,15 @@ func main() {
 	redisClient := newRedisClient()
 	mutex := &sync.Mutex{}
 
-	nodeManagerClient := &nodeManager{httpClient: &httpClient, mutex: mutex}
+	prometheus.MustRegister(httpRequestsTotal)
+	prometheus.MustRegister(blockTransmissedByNode)
+
+	nodeManagerClient := &nodeManager{httpClient: &httpClient, mutex: mutex, redisClient: redisClient}
 	redisManagerClient := &RedisManager{redisClient: redisClient}
 	fileManagerClient := &fileManager{nodeManager: nodeManagerClient, redisManager: redisManagerClient, httpClient: &httpClient, mutex: mutex}
 	clients := &clients{httpClient: httpClient, redisClient: redisClient, mutex: mutex, nodeManager: nodeManagerClient, fileManager: fileManagerClient}
 
 	routerHttp := clients.SetupRouter()
-
-	prometheus.MustRegister(httpRequestsTotal)
 
 	err := http.ListenAndServe(fmt.Sprintf(":%d", serverPort), routerHttp)
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/klauspost/pgzip"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"io"
 	"mime/multipart"
@@ -20,6 +21,14 @@ type fileManager struct {
 	nodeManager  *nodeManager
 	mutex        *sync.Mutex
 }
+
+var blockTransmissedByNode = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "block_transmissed_per_block",
+		Help: "Total number of block trasmissed by node",
+	},
+	[]string{"node"},
+)
 
 func (f *fileManager) DownloadFile(w http.ResponseWriter, r *http.Request) {
 	httpRequestsTotal.WithLabelValues(r.Method, r.URL.Path).Inc()
@@ -474,6 +483,8 @@ func (f *fileManager) TransmitBlock(formattedBs string, selectedNode Node, block
 		zap.String("nodeAddress", selectedNode.address),
 		zap.String("blockHash", formattedBs),
 	)
+
+	blockTransmissedByNode.WithLabelValues(selectedNode.address).Inc()
 
 	return nil
 }
